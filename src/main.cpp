@@ -5,16 +5,15 @@
  * 
  * 対応ボード：IOT Integrated Controller V1
  *            RRH-G101A REV-B
+ * ボード設定：
+ * deepSleep からの起床は、ＩＯ１６ポートがリセット信号に接続されている必要があります。
+ * IOT Integrated Controller V1 ボードのＪＰ１を「ＲＳＴ＃」側にジャンパー。
+ * IO16の初期（入力・出力の設定）は不要です。
  * 
  * 2026-03-30
  * Copyright (c) 2026 rinwado
  * Licensed under the MIT License.
  * See LICENSE file in the project root for full license text.
- */
- /*
-    deepSleep からの起床は、ＩＯ１６ポートがリセット信号に接続されている必要があります。
-    IOT Integrated Controller V1 ボードのＪＰ１を「ＲＳＴ＃」側にジャンパーをしてください。
-    IO16の初期（入力・出力の設定）は不要です。
  */
 
 #include <Arduino.h>
