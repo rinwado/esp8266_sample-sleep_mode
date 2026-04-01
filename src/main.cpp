@@ -1,5 +1,5 @@
 /**
- * タスクスケジューラーとティッカー ライブラリーを使ったスリープモード
+ * タスクスケジューラーとティッカー ライブラリーを使ったスリープモード、起動時情報の取得、
  * 信号のエッジ検出、ESP WROOM 02 内部ＡＤＣの読込のサンプルプログラム
  * for PlatformIO
  * 
@@ -11,6 +11,11 @@
  * Licensed under the MIT License.
  * See LICENSE file in the project root for full license text.
  */
+ /*
+    deepSleep からの起床は、ＩＯ１６ポートがリセット信号に接続されている必要があります。
+    IOT Integrated Controller V1 ボードのＪＰ１を「ＲＳＴ＃」側にジャンパーをしてください。
+    IO16の初期（入力・出力の設定）は不要です。
+ */
 
 #include <Arduino.h>
 #include <Ticker.h>
@@ -21,11 +26,11 @@ extern "C" {
 
 /// 定義
 #define ADC_VCC_MODE          (0)           //1:ADCの入力がチップ内部の電源ラインを読む、 0:ADCの入力が外部のA0ピンの値を読む
-#define ADC_A0_LSB_MV         (0.976562F)   //1000mV ÷ 1024
 #define CHECK_INTERRUPT_TIME  (0)           //onTickTimerISR　の処理股間を確認する場合（１）
-#define SW2_PIN               (0)           //プログラムボタンと兼用しているので、起動時の検出はできない
-#define SW2_BUTTON            (0x01)
+#define ADC_A0_1LSB_MV        (0.976562F)   //1000mV ÷ 1024
 #define RTC_RAM_CHECK_CODE    (0x86C3A524)  //4byte, RTC RAM 初期化判断
+#define SW2_PIN               (0)           //プログラムボタンと兼用しているので、起動時の検出はできない
+#define SW2_BUTTON            (0x01)        //0000_0001
 
 /// 構造体
 typedef struct rtc_mem
@@ -41,10 +46,10 @@ void MainWork_Callback(void);
 void TskOneShot_ProcCallback(void);
 
 /// オブジェクト生成
-Scheduler TskRunner;                      //スケジューラ
 Ticker tick_timer1;                       //ティッカー割り込み
-//Task(周期ms, 実行回数[-1は無限], 実行する関数, スケジューラへのポインタ)
+Scheduler TskRunner;                      //スケジューラ
 //Taskの宣言した順にタスク管理リストに登録され、管理リストの順に実行タイミングがチェックされる。
+//Task(周期ms, 実行回数[-1は無限], 実行する関数, スケジューラへのポインタ)
 Task tsk_main_work(1, TASK_FOREVER, &MainWork_Callback, &TskRunner);                      //[main_work]タスクの作成
 Task tsk_OneShot_01(TASK_IMMEDIATE, TASK_ONCE, &TskOneShot_ProcCallback, &TskRunner);     //[Proc]OneShotタスクの作成
 
@@ -56,18 +61,17 @@ volatile bool f_counter_trigger = false;  //割込みカウンタによるトリ
 #if(CHECK_INTERRUPT_TIME)
 volatile uint32_t elapsed_cycles = 0;     //経過サイクル数(割込み処置にかかった経過時間計測のために)
 #endif
+uint8_t doWork_count = 0;                 //起床後の動作時間用のカウンタ
 
-uint8_t doWork_count = 0;
+struct rst_info* ResetStartInfo;          //リセット情報
+rtc_mem_t RTC_RAM_B1;                     //RTC RAM
 
-struct rst_info* ResetStartInfo;  //リセット情報
-rtc_mem_t RTC_RAM_B1;             //RTC RAM
-
-
+//----
 #if(ADC_VCC_MODE)
-ADC_MODE(ADC_VCC);
-#define ESP8266_ADC_READ  ESP.getVcc()
+ADC_MODE(ADC_VCC);                        //ADCは内部のVCC電圧を測定するモードにする（コンパイル時の設定可能）
+#define ESP8266_ADC_READ  ESP.getVcc()    //内部のVCC電圧を読み出す場合
 #else
-#define ESP8266_ADC_READ  analogRead(A0)
+#define ESP8266_ADC_READ  analogRead(A0)  //通常のＡ０端子のアナログ入力を読み出す
 #endif
 
 
@@ -89,7 +93,7 @@ void setup()
   { //電源が完全に切れた後の初回起動と判断
     RTC_RAM_B1.pu_ram_code = RTC_RAM_CHECK_CODE;  //起動時にコードをセット
     RTC_RAM_B1.pu_counter = 0;                    //初回起動時に初期化
-    RTC_RAM_B1.sleep_mode = -1;                   //
+    RTC_RAM_B1.sleep_mode = 0;                    //スリープしない
   }
   RTC_RAM_B1.pu_counter++;
   ESP.rtcUserMemoryWrite(0, (uint32_t*)&RTC_RAM_B1, sizeof(RTC_RAM_B1));
@@ -155,12 +159,82 @@ void loop()
     if(0 < (RTC_RAM_B1.sleep_mode & 0x00000003))
     { //Sleep にはいる
       Serial.printf("Going to Deep-sleep for 30 seconds...\r\n");
-      ESP.deepSleep(30 * 1000000); 
+      ESP.deepSleep(30 * 1000000);  //uS単位で指定 
       delay(1000);
     }
   }
 }
 
+
+
+/**
+ * @brief TaskScheduler コールバック関数
+ *        １ｍｓ 間隔で実行される
+ */
+void MainWork_Callback(void)
+{
+  #if(0)
+  if(f_counter_trigger)
+  { f_counter_trigger = false;
+    Serial.printf("TASK: MainWork Proc.\r\n");
+  }
+  #endif
+
+  //ＳＷ２ボタンフラグ確認（押下）
+  if(0 != (f_FE_SignalDetect & SW2_BUTTON))
+  { //ＳＷ２が押下された
+    Serial.printf("TASK: MainWork Proc (SW2 ON...)\r\n");
+
+    #if(CHECK_INTERRUPT_TIME)
+    //80MHz動作の場合、1サイクル = 0.0125μS (1μS = 80サイクル)
+    float elapsed_us = elapsed_cycles / 80.0; 
+    Serial.printf("Elapsed cycles: %d, Elapsed time: %d[us]\r\n", (int)elapsed_cycles, (int)elapsed_us);
+    #endif
+
+    f_FE_SignalDetect &= ~SW2_BUTTON;   //SW2_BUTTON フラグクリア
+  }
+  //ＳＷ２ボタンフラグ確認（離上）
+  if(0 != (f_RE_SignalDetect & SW2_BUTTON))
+  { //ＳＷ２が離された
+    Serial.printf("TASK: MainWork Proc (SW2 OFF..)\r\n");
+
+    //スリープモード変更し、RTC RAMに保存
+    RTC_RAM_B1.sleep_mode++; 
+    ESP.rtcUserMemoryWrite(0, (uint32_t*)&RTC_RAM_B1, sizeof(RTC_RAM_B1));
+    Serial.printf("Sleep Mode (%d), 0:no sleep, 1..3:deep sleep\r\n", (int)(RTC_RAM_B1.sleep_mode & 0x00000003));
+    doWork_count = 0;     //doWork_count をクリア
+
+    f_RE_SignalDetect &= ~SW2_BUTTON;   //SW2_BUTTON フラグクリア
+  }
+}
+
+/**
+ * @brief ワンショット処理タスク
+ *        ティックタイマー割込みの「リスタート」で処理が行われる
+ *        処理が終わるとタスクは、disable（休止状態）
+ */
+void TskOneShot_ProcCallback(void)
+{
+  static int8_t  add_cnt = 0;
+  static uint32_t adc_dfata = 0;
+
+  //ＡＤコンバート
+  adc_dfata += (uint32_t)ESP8266_ADC_READ;
+  add_cnt++;
+  if(3 <= add_cnt)
+  { //３回サンプリングの平均
+    Serial.printf("TASK: OneShot Proc.\r\n");
+    #if(ADC_VCC_MODE)
+    Serial.printf("ESP-WROOM VCC: %d[mV]\r\n", (uint16_t)(adc_dfata / 3));
+    #else
+    int voltage = (int)((float)adc_dfata / 3.0) * ADC_A0_1LSB_MV;
+    Serial.printf("ESP-WROOM A0(%d): %d[mV]\r\n", (int)(adc_dfata / 3), voltage);
+    #endif
+    add_cnt = 0;
+    adc_dfata = 0;
+  }
+  doWork_count++; //0.5S に一回カウント（「loop()」内で、このカウンタ値をみ見てスリープに入るか確認）
+}
 
 
 /**
@@ -208,7 +282,6 @@ void IRAM_ATTR onTickTimerISR(void)
       }
   }
 
-
   //-----
   gn_cnt1++;
   #if(0)
@@ -230,71 +303,4 @@ void IRAM_ATTR onTickTimerISR(void)
   uint32_t end_cycle = ESP.getCycleCount();             //抜け出すときにカウント数
   elapsed_cycles = end_cycle - start_cycle;             //処理にかかったカウント数
   #endif
-}
-
-/**
- * @brief TaskScheduler コールバック関数
- *        １ｍｓ 間隔で実行される
- */
-void MainWork_Callback(void)
-{
-  #if(0)
-  if(f_counter_trigger)
-  { f_counter_trigger = false;
-    Serial.printf("TASK: MainWork Proc.\r\n");
-  }
-  #endif
-
-  //ＳＷ２ボタンフラグ確認（押下）
-  if(0 != (f_FE_SignalDetect & SW2_BUTTON))
-  { //ＳＷ２が押下された
-    Serial.printf("TASK: MainWork Proc (SW2 ON...)\r\n");
-
-    #if(CHECK_INTERRUPT_TIME)
-    //80MHz動作の場合、1サイクル = 0.0125μS (1μS = 80サイクル)
-    float elapsed_us = elapsed_cycles / 80.0; 
-    Serial.printf("Elapsed cycles: %d, Elapsed time: %d[us]\r\n", (int)elapsed_cycles, (int)elapsed_us);
-    #endif
-
-    f_FE_SignalDetect &= ~SW2_BUTTON;
-  }
-
-  //ＳＷ２ボタンフラグ確認（離上）
-  if(0 != (f_RE_SignalDetect & SW2_BUTTON))
-  { //ＳＷ２が離された
-    Serial.printf("TASK: MainWork Proc (SW2 OFF..)\r\n");
-
-    RTC_RAM_B1.sleep_mode++;
-    Serial.printf("Sleep Mode (%d), 0:no sleep, 1..3:deep sleep\r\n", (int)(RTC_RAM_B1.sleep_mode & 0x00000003));
-    ESP.rtcUserMemoryWrite(0, (uint32_t*)&RTC_RAM_B1, sizeof(RTC_RAM_B1));
-
-    f_RE_SignalDetect &= ~SW2_BUTTON;
-  }
-}
-
-/**
- * @brief ワンショット処理タスク
- *        ティックタイマー割込みの「リスタート」で処理が行われる
- *        処理が終わるとタスクは、disable（休止状態）
- */
-void TskOneShot_ProcCallback(void)
-{
-  static int8_t  add_cnt = 0;
-  static uint32_t adc_dfata = 0;
-
-  adc_dfata += (uint32_t)ESP8266_ADC_READ;
-  add_cnt++;
-  if(3 <= add_cnt)
-  { //３回サンプリングの平均
-    Serial.printf("TASK: OneShot Proc.\r\n");
-    #if(ADC_VCC_MODE)
-    Serial.printf("ESP-WROOM VCC: %d[mV]\r\n", (uint16_t)(adc_dfata / 3));
-    #else
-    int voltage = (int)((float)adc_dfata / 3.0) * ADC_A0_LSB_MV;
-    Serial.printf("ESP-WROOM A0(%d): %d[mV]\r\n", (int)(adc_dfata / 3), voltage);
-    #endif
-    add_cnt = 0;
-    adc_dfata = 0;
-  }
-  doWork_count++; //0.5S に一回カウント
 }
