@@ -28,9 +28,11 @@ extern "C" {
 #define CHECK_INTERRUPT_TIME  (0)           //onTickTimerISR　の処理股間を確認する場合（１）
 #define ADC_A0_1LSB_MV        (0.976562F)   //1000mV ÷ 1024
 #define RTC_RAM_CHECK_CODE    (0x86C3A524)  //4byte, RTC RAM 初期化判断
-#define SW2_PIN               (0)           //プログラムボタンと兼用しているので、起動時の検出はできない
+#define IO0_PIN               (0)           //プログラムボタンと兼用[SW2/IN1]しているので、起動時の検出はできない
+#define IO2_PIN               (2)           //IN2
 #define BUZZER_PIN            (13)          //ブザー制御出力　１でブザーＯＮ、０でブザーＯＦＦ
-#define SW2_BUTTON            (0x01)        //0000_0001
+#define SW2_ISOIN1            (0x01)        //0000_0001
+#define ISOIN2                (0x02)        //0000_0010
 
 /// 構造体
 typedef struct rtc_mem
@@ -84,8 +86,9 @@ void setup()
   //--- IOピン出力設定
   digitalWrite(BUZZER_PIN, LOW);   //BuzzerをOFF
   //--- IOピン設定
-  pinMode(SW2_PIN, INPUT);
   pinMode(BUZZER_PIN, OUTPUT);    //リセットからこのコードが実行されるまでの間ブザーが鳴ります。実行されればブザーＯＦＦ）
+  pinMode(IO0_PIN, INPUT);
+  pinMode(IO2_PIN, INPUT);
 
   //--- リセットスタート時の起動情報を取得
   ResetStartInfo = system_get_rst_info();
@@ -187,10 +190,10 @@ void MainWork_Callback(void)
   }
   #endif
 
-  //ＳＷ２ボタンフラグ確認（押下）
-  if(0 != (f_FE_SignalDetect & SW2_BUTTON))
+  //ＳＷ２ボタンフラグ確認（押下）（絶縁入力１）
+  if(0 != (f_FE_SignalDetect & SW2_ISOIN1))
   { //ＳＷ２が押下された
-    Serial.printf("TASK: MainWork Proc (SW2 ON...)\r\n");
+    Serial.printf("TASK: MainWork Proc (SW2[IN1] ON...)\r\n");
     digitalWrite(BUZZER_PIN, HIGH); //BuzzerをON
 
     #if(CHECK_INTERRUPT_TIME)
@@ -199,12 +202,12 @@ void MainWork_Callback(void)
     Serial.printf("Elapsed cycles: %d, Elapsed time: %d[us]\r\n", (int)elapsed_cycles, (int)elapsed_us);
     #endif
 
-    f_FE_SignalDetect &= ~SW2_BUTTON;   //SW2_BUTTON フラグクリア
+    f_FE_SignalDetect &= ~SW2_ISOIN1;   //SW2_ISOIN1 フラグクリア
   }
-  //ＳＷ２ボタンフラグ確認（離上）
-  if(0 != (f_RE_SignalDetect & SW2_BUTTON))
+  //ＳＷ２ボタンフラグ確認（離上）（絶縁入力１）
+  if(0 != (f_RE_SignalDetect & SW2_ISOIN1))
   { //ＳＷ２が離された
-    Serial.printf("TASK: MainWork Proc (SW2 OFF..)\r\n");
+    Serial.printf("TASK: MainWork Proc (SW2[IN1] OFF..)\r\n");
     digitalWrite(BUZZER_PIN, LOW);  //BuzzerをOFF
 
     //スリープモード変更し、RTC RAMに保存
@@ -213,7 +216,22 @@ void MainWork_Callback(void)
     Serial.printf("Sleep Mode (%d), 0:no sleep, 1..3:deep sleep\r\n", (int)(RTC_RAM_B1.sleep_mode & 0x00000003));
     doWork_count = 0;     //doWork_count をクリア
 
-    f_RE_SignalDetect &= ~SW2_BUTTON;   //SW2_BUTTON フラグクリア
+    f_RE_SignalDetect &= ~SW2_ISOIN1;   //SW2_ISOIN1 フラグクリア
+  }
+
+  //絶縁入力２　フラグ確認
+  if(0 != (f_FE_SignalDetect & ISOIN2))
+  { //絶縁入力２　ＯＮ
+    Serial.printf("TASK: MainWork Proc (ISO IN2 ON...)\r\n");
+
+    f_FE_SignalDetect &= ~ISOIN2;   //ISOIN2 フラグクリア
+  }
+  //絶縁入力２　フラグ確認
+  if(0 != (f_RE_SignalDetect & ISOIN2))
+  { //絶縁入力２　ＯＦＦ
+    Serial.printf("TASK: MainWork Proc (ISO IN2 OFF..)\r\n");
+
+    f_RE_SignalDetect &= ~ISOIN2;   //ISOIN2 フラグクリア
   }
 }
 
@@ -263,7 +281,8 @@ void IRAM_ATTR onTickTimerISR(void)
   #endif
 
   //信号サンプリング
-  IO_SignalMonitorVal = (0 != digitalRead(SW2_PIN))?  (IO_SignalMonitorVal | SW2_BUTTON)  : (IO_SignalMonitorVal & ~SW2_BUTTON);  //IO0 (sw2 button)
+  IO_SignalMonitorVal = (0 != digitalRead(IO0_PIN))?  (IO_SignalMonitorVal | SW2_ISOIN1)  : (IO_SignalMonitorVal & ~SW2_ISOIN1);  //IO0 (sw2 button, ISO-IN1)
+  IO_SignalMonitorVal = (0 != digitalRead(IO2_PIN))?  (IO_SignalMonitorVal | ISOIN2)      : (IO_SignalMonitorVal & ~ISOIN2);      //IO2 (ISO-IN2)
 
   //フィルターと信号安定チェック
   ssv = 0;
@@ -284,10 +303,12 @@ void IRAM_ATTR onTickTimerISR(void)
       if((fe != 0x00) || (re != 0x00))
       {	//立下り、立ち上がりの変化あり
           //信号　変化(H -> L)
-          if(0 != (fe & SW2_BUTTON))     f_FE_SignalDetect |= SW2_BUTTON;     //bit0:
+          if(0 != (fe & SW2_ISOIN1))     f_FE_SignalDetect |= SW2_ISOIN1;     //bit0:
+          if(0 != (fe & ISOIN2))         f_FE_SignalDetect |= ISOIN2;         //bit1:
 
           //信号　変化(L -> H)
-          if(0 != (re & SW2_BUTTON))     f_RE_SignalDetect |= SW2_BUTTON;     //bit0:
+          if(0 != (re & SW2_ISOIN1))     f_RE_SignalDetect |= SW2_ISOIN1;     //bit0:
+          if(0 != (re & ISOIN2))         f_RE_SignalDetect |= ISOIN2;         //bit1:
       }
   }
 
